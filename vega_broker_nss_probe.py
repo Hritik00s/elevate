@@ -27,7 +27,7 @@ from typing import Any
 
 VERSION = "1.0"
 NSSWITCH = Path("/etc/nsswitch.conf")
-DEFAULT_WORK_ROOT = Path("/mnt/workspace")
+DEFAULT_WORK_ROOT = Path("/tmp/elt")
 STATE_FILENAME = "vega_nss_probe_active.json"
 BROKER_NEEDLE = "vega_agentcore.broker"
 SECRET_FIELDS = (
@@ -790,7 +790,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--work-root",
         default=str(DEFAULT_WORK_ROOT),
-        help="persistent writable directory (default: /mnt/workspace)",
+        help="persistent writable directory (default: /tmp/elt)",
     )
     result.add_argument("--port", type=int, default=8082, help="broker egress port")
     result.add_argument(
