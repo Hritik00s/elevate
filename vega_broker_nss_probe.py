@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.1"
+VERSION = "1.2"
 NSSWITCH = Path("/etc/nsswitch.conf")
 DEFAULT_WORK_ROOT = Path("/tmp/elt")
 STATE_FILENAME = "vega_nss_probe_active.json"
@@ -100,13 +100,16 @@ def find_brokers() -> list[dict[str, Any]]:
             uid = -1
         try:
             mount_ns = os.readlink(f"/proc/{pid}/ns/mnt")
-        except OSError:
-            mount_ns = "unreadable"
+            mount_ns_error = None
+        except OSError as exc:
+            mount_ns = None
+            mount_ns_error = f"{type(exc).__name__}: {exc}"
         brokers.append(
             {
                 "pid": pid,
                 "uid": uid,
                 "mount_ns": mount_ns,
+                "mount_ns_error": mount_ns_error,
                 "cmdline": cmdline,
                 "no_new_privs": status.get("NoNewPrivs"),
                 "seccomp": status.get("Seccomp"),
@@ -277,8 +280,13 @@ def preflight(compiler: str | None) -> dict[str, Any]:
     directories = library_directories(compiler)
     writable_directories = [str(path) for path in directories if os.access(path, os.W_OK)]
     same_uid = bool(brokers) and any(item["uid"] == os.getuid() for item in brokers)
-    same_mount = bool(brokers) and any(
-        item["mount_ns"] == self_mount_ns for item in brokers
+    known_mounts = [item["mount_ns"] for item in brokers if item["mount_ns"]]
+    same_mount: bool | None = (
+        True
+        if self_mount_ns != "unreadable" and self_mount_ns in known_mounts
+        else False
+        if len(known_mounts) == len(brokers) and brokers
+        else None
     )
     broker_visibility = broker_path_visibility(
         [item for item in brokers if item["uid"] == os.getuid()],
@@ -605,6 +613,7 @@ def save_result(
 
 def restore_state(state: dict[str, Any], *, quiet: bool = False) -> list[str]:
     notes: list[str] = []
+    restoration_failed = False
     service = state.get("service")
     if service and NSSWITCH.exists():
         try:
@@ -616,6 +625,7 @@ def restore_state(state: dict[str, Any], *, quiet: bool = False) -> list[str]:
             else:
                 notes.append("nsswitch service entry already absent")
         except OSError as exc:
+            restoration_failed = True
             notes.append(f"could not restore nsswitch.conf: {exc}")
 
     module_path = state.get("module_path")
@@ -624,9 +634,10 @@ def restore_state(state: dict[str, Any], *, quiet: bool = False) -> list[str]:
             Path(module_path).unlink(missing_ok=True)
             notes.append(f"removed {module_path}")
         except OSError as exc:
+            restoration_failed = True
             notes.append(f"could not remove module: {exc}")
 
-    state["active"] = False
+    state["active"] = restoration_failed
     state["restored_at"] = time.time()
     try:
         atomic_json(Path(state["state_path"]), state)
@@ -682,12 +693,14 @@ def create_probe(args: argparse.Namespace, report: dict[str, Any]) -> dict[str, 
     atomic_json(run_dir / "preflight.json", report)
     atomic_json(active_path, state)
 
+    nss_write_completed = False
     try:
         # Persist the cleanup intent before the in-place write can truncate or
         # partially update nsswitch.conf.
         state["active"] = True
         atomic_json(active_path, state)
         write_in_place(NSSWITCH, modified_nss)
+        nss_write_completed = True
 
         failures: list[str] = []
         for directory_text in report["writable_library_directories"]:
@@ -724,6 +737,13 @@ def create_probe(args: argparse.Namespace, report: dict[str, Any]) -> dict[str, 
         )
     except BaseException:
         if state.get("active"):
+            if not nss_write_completed:
+                # A failed in-place write can leave a partial file. The saved
+                # bytes are needed because the service prefix may be truncated.
+                try:
+                    write_in_place(NSSWITCH, original_nss)
+                except OSError:
+                    pass
             restore_state(state, quiet=True)
         raise
 
@@ -733,8 +753,12 @@ def print_preflight(report: dict[str, Any], outcome: str) -> None:
     emit("INFO", f"broker_pids={[item['pid'] for item in report['brokers']]}")
     emit(
         "INFO",
-        f"same_uid={report['same_uid_as_broker']} same_mount_ns={report['same_mount_namespace_as_broker']}",
+        f"same_uid={report['same_uid_as_broker']} "
+        f"same_mount_ns={'unknown' if report['same_mount_namespace_as_broker'] is None else report['same_mount_namespace_as_broker']}",
     )
+    for item in report["brokers"]:
+        if item["mount_ns_error"]:
+            emit("INFO", f"broker_mount_ns pid={item['pid']} {item['mount_ns_error']}")
     for item in report["broker_path_visibility"]:
         emit(
             "INFO",
@@ -764,7 +788,10 @@ def action_run_or_arm(args: argparse.Namespace) -> int:
     viable, preflight_result = preflight_outcome(report)
     print_preflight(report, preflight_result)
     if not viable:
-        return 1
+        if args.attempt_unverified_paths and preflight_result == "INCONCLUSIVE_BROKER_PATH_VISIBILITY_UNVERIFIED":
+            emit("WARN", "broker paths could not be inspected; attempting active NSS marker probe")
+        else:
+            return 1
 
     state: dict[str, Any] | None = None
     try:
@@ -792,6 +819,9 @@ def action_run_or_arm(args: argparse.Namespace) -> int:
 
         if not args.keep_active:
             restore_state(state)
+            if state.get("active"):
+                emit("ERROR", "automatic cleanup incomplete; run restore again")
+                return 1
         else:
             emit("INFO", "probe remains armed; use status after a normal Vega request")
         return 0
@@ -852,8 +882,9 @@ def action_restore(args: argparse.Namespace) -> int:
     try:
         _, state = load_active_state(args)
         restore_state(state)
-        emit("RESULT", "RESTORED")
-        return 0
+        outcome = "RESTORE_INCOMPLETE" if state.get("active") else "RESTORED"
+        emit("RESULT", outcome)
+        return 1 if state.get("active") else 0
     except (OSError, ProbeFailure, json.JSONDecodeError) as exc:
         emit("ERROR", f"{type(exc).__name__}: {exc}")
         return 1
@@ -891,6 +922,11 @@ def parser() -> argparse.ArgumentParser:
         "--keep-active",
         action="store_true",
         help="do not restore automatically after an inconclusive or successful run",
+    )
+    result.add_argument(
+        "--attempt-unverified-paths",
+        action="store_true",
+        help="allow an active probe when broker /proc/root paths cannot be inspected",
     )
     return result
 
