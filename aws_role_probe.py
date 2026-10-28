@@ -107,11 +107,20 @@ def imds_children(data):
     return children
 
 
-def imds_walk(base, token, *, out_path, max_nodes=4096, max_depth=32, max_seconds=180, max_bytes=2 * 1024 * 1024, all_versions=False):
+def imds_walk(base, token, *, out_path, max_nodes=4096, max_depth=32, max_seconds=180,
+              max_bytes=2 * 1024 * 1024, all_versions=False, extra_paths=()):
     """Walk directory listings under latest, plus root and known sibling paths."""
     pending = deque([("/", 0, True), ("/latest/", 1, True),
                      ("/latest/meta-data/", 2, True), ("/latest/dynamic/", 2, True),
-                     ("/latest/user-data", 2, False)])
+                     ("/latest/user-data", 2, False),
+                     # Some runtimes expose IAM credentials without advertising iam/.
+                     ("/latest/meta-data/iam/", 3, True),
+                     ("/latest/meta-data/iam/info", 4, False),
+                     ("/latest/meta-data/iam/security-credentials/", 4, True),
+                     ("/latest/meta-data/identity-credentials/ec2/info", 5, False),
+                     ("/latest/meta-data/identity-credentials/ec2/security-credentials/ec2-instance", 6, False),
+                     ("/latest/meta-data/tags/instance/", 4, True)])
+    pending.extend((path, path.count("/"), path.endswith("/")) for path in extra_paths)
     seen = {"/latest/api/token"}
     records = {"/latest/api/token": {"http": 200, "method": "PUT", "kind": "token_endpoint", "body": "[redacted]"}}
     print("[IMDS 200] /latest/api/token TOKEN (PUT; body redacted)")
@@ -144,6 +153,10 @@ def imds_walk(base, token, *, out_path, max_nodes=4096, max_depth=32, max_second
                 for name, child_is_dir in children:
                     if path == "/" and not all_versions and name.rstrip("/") != "latest":
                         continue  # Historical version aliases duplicate the latest tree.
+                    if path == "/":
+                        name, child_is_dir = name.rstrip("/") + "/", True
+                    elif re.fullmatch(r"/(?:latest|\d{4}-\d{2}-\d{2}|1\.0)/", path) and name.rstrip("/") in ("meta-data", "dynamic", "api"):
+                        name, child_is_dir = name.rstrip("/") + "/", True
                     pending.append((path + name, depth + 1, child_is_dir))
             else:
                 record["kind"] = "leaf"
@@ -168,7 +181,7 @@ def imds_walk(base, token, *, out_path, max_nodes=4096, max_depth=32, max_second
     if truncated_paths:
         limits.append("response size limit")
     report = {
-        "scope": "all available latest paths; historical aliases only with --imds-all-versions",
+        "scope": "discoverable latest tree plus known unlisted IAM, identity, and tag paths; historical aliases only with --imds-all-versions",
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "paths": records,
         "ecr_images": {k: sorted(v) for k, v in ecr_matches.items()},
@@ -444,6 +457,7 @@ def main():
     parser.add_argument("--no-imds-scan", action="store_true", help="Skip recursive IMDS walk; run AWS API probes only")
     parser.add_argument("--imds-out", default="/tmp/elt/imds_dump.json", help="Single private JSON file containing all fetched IMDS responses")
     parser.add_argument("--imds-all-versions", action="store_true", help="Also traverse historical API version aliases exposed at the metadata root")
+    parser.add_argument("--imds-extra-path", action="append", default=[], help="Probe an additional known but unlisted /latest/... path; repeatable")
     parser.add_argument("--imds-max-nodes", type=int, default=4096)
     parser.add_argument("--imds-max-depth", type=int, default=32)
     parser.add_argument("--imds-max-seconds", type=int, default=180)
@@ -455,13 +469,18 @@ def main():
         parser.error("--imds-only conflicts with --no-imds-scan")
     if min(args.imds_max_nodes, args.imds_max_depth, args.imds_max_seconds, args.imds_max_bytes) <= 0:
         parser.error("IMDS limits must be positive")
+    for path in args.imds_extra_path:
+        if (not path.startswith("/latest/") or "?" in path or "#" in path
+                or any(part in (".", "..") for part in path.split("/"))):
+            parser.error("--imds-extra-path must be an absolute /latest/... path without query or traversal")
     if not args.no_imds_scan:
         try:
             base = imds_origin()
             token = imds_token(base, args.imds_max_seconds + 60)
             imds_walk(base, token, out_path=args.imds_out, max_nodes=args.imds_max_nodes,
                       max_depth=args.imds_max_depth, max_seconds=args.imds_max_seconds,
-                      max_bytes=args.imds_max_bytes, all_versions=args.imds_all_versions)
+                      max_bytes=args.imds_max_bytes, all_versions=args.imds_all_versions,
+                      extra_paths=args.imds_extra_path)
         except (OSError, ValueError, urllib.error.URLError) as exc:
             detail = str(exc) if isinstance(exc, ValueError) else transport_reason(exc)
             print("[IMDS_STOP] recursive scan unavailable:", detail, file=sys.stderr)
