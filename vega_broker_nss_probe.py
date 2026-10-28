@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.3"
+VERSION = "1.4"
 NSSWITCH = Path("/etc/nsswitch.conf")
 DEFAULT_WORK_ROOT = Path("/tmp/elt")
 STATE_FILENAME = "vega_nss_probe_active.json"
@@ -36,7 +36,12 @@ SECRET_FIELDS = (
     "_git_authorization",
     "_gonfalon_authorization",
 )
-CTF_FIELDS = ("_token", "_ldso_cookie", "_git_authorization")
+CTF_FIELDS = (
+    "_token",
+    "_ldso_cookie",
+    "_git_authorization",
+    "_gonfalon_authorization",
+)
 
 
 class ProbeFailure(RuntimeError):
@@ -977,7 +982,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--extract-ctf-values",
         action="store_true",
-        help="write three candidate broker credential values to a local mode-0600 file",
+        help="write up to four candidate broker credential values to a local mode-0600 file",
     )
     return result
 
