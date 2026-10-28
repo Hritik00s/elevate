@@ -3,8 +3,8 @@
 
 This probe tests whether a same-UID agent can modify glibc NSS configuration,
 cause the credential broker to load an NSS module, and execute code in the
-broker. By default, evidence records only whether credential fields exist.
-The explicit CTF extraction mode writes selected values locally.
+broker. By default, the CTF extraction mode writes selected values locally.
+Use --no-extract-ctf-values for presence-only evidence.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.4"
+VERSION = "1.5"
 NSSWITCH = Path("/etc/nsswitch.conf")
 DEFAULT_WORK_ROOT = Path("/tmp/elt")
 STATE_FILENAME = "vega_nss_probe_active.json"
@@ -830,6 +830,7 @@ def action_preflight(args: argparse.Namespace) -> int:
 
 
 def action_run_or_arm(args: argparse.Namespace) -> int:
+    emit("INFO", f"extract_ctf_values={args.extract_ctf_values}")
     compiler = find_compiler()
     report = preflight(compiler)
     viable, preflight_result = preflight_outcome(report)
@@ -979,11 +980,20 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow an active probe when broker /proc/root paths cannot be inspected",
     )
-    result.add_argument(
+    extraction = result.add_mutually_exclusive_group()
+    extraction.add_argument(
         "--extract-ctf-values",
+        dest="extract_ctf_values",
         action="store_true",
-        help="write up to four candidate broker credential values to a local mode-0600 file",
+        help="write up to four candidate broker credential values to a local mode-0600 file (default)",
     )
+    extraction.add_argument(
+        "--no-extract-ctf-values",
+        dest="extract_ctf_values",
+        action="store_false",
+        help="record credential presence without writing the values",
+    )
+    result.set_defaults(extract_ctf_values=True)
     return result
 
 
