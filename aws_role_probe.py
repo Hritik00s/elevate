@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Read-only, dependency-free AWS permission probe for this AgentCore CTF.
+"""Read-only, dependency-free IMDS and AWS probe for this AgentCore CTF.
 
-Gets fresh temporary credentials from the configured IMDSv2 endpoint, signs a
-small set of AWS API requests with SigV4, and prints no credential or data body.
-Only a successful request proves access to the particular action and resource.
+Recursively walks discoverable IMDS paths, saves their responses in one private
+JSON file, and optionally tests specific AWS API actions using fresh credentials.
+IMDS response bodies (including credentials) are never printed by default.
 """
 
 import argparse
 import base64
+from collections import deque
 import datetime as dt
 import hashlib
 import hmac
 import json
 import os
 import re
+import socket
+import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +27,9 @@ import xml.etree.ElementTree as ET
 TIMEOUT = 6
 MAX_REPLY = 8 * 1024 * 1024
 NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+ECR_URI = re.compile(r"(?:\d{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com|public\.ecr\.aws)/[a-z0-9._/-]+(?::[A-Za-z0-9._-]+|@sha256:[a-f0-9]{64})?")
+FLAG_CANDIDATE = re.compile(r"(?i)\b(?:[A-Z0-9_]*FLAG|CTF)\{[^}\r\n]{1,160}\}")
+CHILD_SEGMENT = re.compile(r"[A-Za-z0-9_~:@%+.-]+")
 
 
 def no_proxy_call(url, *, method="GET", headers=None):
@@ -31,14 +38,24 @@ def no_proxy_call(url, *, method="GET", headers=None):
         return res.read(MAX_REPLY).decode("utf-8", "replace")
 
 
-def metadata_credentials():
-    base = os.environ.get("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://169.254.169.254")
+def imds_origin():
+    base = os.environ.get("AWS_EC2_METADATA_SERVICE_ENDPOINT", "")
+    if not base:
+        raise ValueError("AWS_EC2_METADATA_SERVICE_ENDPOINT is unset")
     parsed = urllib.parse.urlsplit(base)
     if (parsed.scheme != "http" or not parsed.netloc or parsed.path not in ("", "/")
             or parsed.query or parsed.fragment or parsed.username or parsed.password):
         raise ValueError("metadata endpoint must be an HTTP origin")
-    base = base.rstrip("/")
-    token = no_proxy_call(base + "/latest/api/token", method="PUT", headers={"X-aws-ec2-metadata-token-ttl-seconds": "120"})
+    return base.rstrip("/")
+
+
+def imds_token(base, ttl=120):
+    return no_proxy_call(base + "/latest/api/token", method="PUT", headers={"X-aws-ec2-metadata-token-ttl-seconds": str(min(21600, ttl))})
+
+
+def metadata_credentials():
+    base = imds_origin()
+    token = imds_token(base)
     headers = {"X-aws-ec2-metadata-token": token}
     body = no_proxy_call(base + "/latest/meta-data/iam/security-credentials/", headers=headers).strip()
     try:
@@ -54,6 +71,126 @@ def metadata_credentials():
     if not all(isinstance(obj.get(k), str) and obj[k] for k in keys):
         raise ValueError("metadata service returned an incomplete credential set")
     return {k: obj[k] for k in keys}, obj.get("Expiration", "unknown")
+
+
+def imds_fetch(base, token, path, max_bytes):
+    url = base + urllib.parse.quote(path, safe="/-_.~:@")
+    request = urllib.request.Request(url, headers={"X-aws-ec2-metadata-token": token})
+    try:
+        with NO_PROXY.open(request, timeout=3) as response:
+            data = response.read(max_bytes + 1)
+            return response.status, data[:max_bytes], len(data) > max_bytes, ""
+    except urllib.error.HTTPError as exc:
+        data = exc.read(max_bytes + 1)
+        return exc.code, data[:max_bytes], len(data) > max_bytes, ""
+    except (OSError, urllib.error.URLError) as exc:
+        return 0, b"", False, transport_reason(exc)
+
+
+def imds_children(data):
+    """Interpret a directory listing, never arbitrary JSON or user-data, as paths."""
+    try:
+        listing = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if listing.lstrip().startswith(("{", "[", "<", "#!", "Content-Type:", "MIME-Version:")):
+        return None
+    lines = [line.strip() for line in listing.splitlines() if line.strip()]
+    if len(lines) > 1000:
+        return None
+    children = []
+    for name in lines:
+        parts = name.rstrip("/").split("/")
+        if not parts or any(not CHILD_SEGMENT.fullmatch(x) or x in (".", "..") for x in parts):
+            return None
+        children.append((name, name.endswith("/")))
+    return children
+
+
+def imds_walk(base, token, *, out_path, max_nodes=4096, max_depth=32, max_seconds=180, max_bytes=2 * 1024 * 1024, all_versions=False):
+    """Walk directory listings under latest, plus root and known sibling paths."""
+    pending = deque([("/", 0, True), ("/latest/", 1, True),
+                     ("/latest/meta-data/", 2, True), ("/latest/dynamic/", 2, True),
+                     ("/latest/user-data", 2, False)])
+    seen = {"/latest/api/token"}
+    records = {"/latest/api/token": {"http": 200, "method": "PUT", "kind": "token_endpoint", "body": "[redacted]"}}
+    print("[IMDS 200] /latest/api/token TOKEN (PUT; body redacted)")
+    ecr_matches, flag_matches = {}, {}
+    skipped_depth = 0
+    start = time.monotonic()
+    while pending and len(seen) < max_nodes and time.monotonic() - start < max_seconds:
+        path, depth, is_dir = pending.popleft()
+        if depth > max_depth:
+            skipped_depth += 1
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        status, data, truncated, error = imds_fetch(base, token, path, max_bytes)
+        record = {"http": status, "bytes": len(data), "truncated": truncated}
+        if error:
+            record["error"] = error
+        if status == 200:
+            try:
+                record["body"] = data.decode("utf-8")
+                record["encoding"] = "utf-8"
+            except UnicodeDecodeError:
+                record["body"] = base64.b64encode(data).decode("ascii")
+                record["encoding"] = "base64"
+            children = imds_children(data) if is_dir and not truncated else None
+            if children is not None:
+                record["kind"] = "directory"
+                record["children"] = [name for name, _ in children]
+                for name, child_is_dir in children:
+                    if path == "/" and not all_versions and name.rstrip("/") != "latest":
+                        continue  # Historical version aliases duplicate the latest tree.
+                    pending.append((path + name, depth + 1, child_is_dir))
+            else:
+                record["kind"] = "leaf"
+                decoded = data.decode("utf-8", "replace")
+                for value in ECR_URI.findall(decoded):
+                    ecr_matches.setdefault(value, set()).add(path)
+                for value in FLAG_CANDIDATE.findall(decoded):
+                    flag_matches.setdefault(value, set()).add(path)
+        records[path] = record
+        display = "DIR" if record.get("kind") == "directory" else "LEAF"
+        print(f"[IMDS {status or error}] {path} {display} bytes={len(data)}" +
+              (" TRUNCATED" if truncated else ""))
+    limits = []
+    if pending:
+        if len(seen) >= max_nodes:
+            limits.append("node limit")
+        if time.monotonic() - start >= max_seconds:
+            limits.append("time limit")
+    if skipped_depth:
+        limits.append("depth limit")
+    truncated_paths = [path for path, record in records.items() if record.get("truncated")]
+    if truncated_paths:
+        limits.append("response size limit")
+    report = {
+        "scope": "all available latest paths; historical aliases only with --imds-all-versions",
+        "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "paths": records,
+        "ecr_images": {k: sorted(v) for k, v in ecr_matches.items()},
+        "flag_candidates": {k: sorted(v) for k, v in flag_matches.items()},
+        "limits": limits,
+        "skipped_depth": skipped_depth,
+        "truncated_paths": truncated_paths,
+        "unvisited_queued_paths": len(pending),
+    }
+    parent = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(out_path, flags, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as output:
+        json.dump(report, output, indent=2, ensure_ascii=False)
+    for value, paths in sorted(ecr_matches.items()):
+        print("[ECR_IMAGE]", value, "from", ",".join(sorted(paths)))
+    for value, paths in sorted(flag_matches.items()):
+        print("[FLAG_CANDIDATE]", value, "from", ",".join(sorted(paths)))
+    print(f"[IMDS_SUMMARY] visited={len(seen)} remaining={len(pending)} limits={','.join(limits) or 'none'} report={out_path}")
+    return report
 
 
 def hmac256(key, message):
@@ -138,6 +275,26 @@ def category(status, blob, headers):
     return "INCONCLUSIVE", code
 
 
+def transport_reason(exc):
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, socket.gaierror):
+        return f"DNS(errno={reason.errno})"
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return "TIMEOUT"
+    if isinstance(reason, ssl.SSLError):
+        return f"TLS({getattr(reason, 'reason', 'error')})"
+    if isinstance(reason, ConnectionRefusedError):
+        return "CONNECTION_REFUSED"
+    if isinstance(reason, ConnectionResetError):
+        return "CONNECTION_RESET"
+    tunnel = re.search(r"Tunnel connection failed:\s*(\d{3})", str(reason))
+    if tunnel:
+        return f"PROXY_TUNNEL_HTTP_{tunnel.group(1)}"
+    if isinstance(reason, OSError):
+        return f"{type(reason).__name__}(errno={reason.errno})"
+    return type(reason).__name__
+
+
 class Probe:
     def __init__(self, creds, region):
         self.creds = creds
@@ -149,7 +306,7 @@ class Probe:
             status, blob, response_headers = signed_request(self.creds, sign_region or self.region, service, method, url, data=data, extra=headers)
             verdict, code = category(status, blob, response_headers)
         except (OSError, ValueError, urllib.error.URLError) as exc:
-            verdict, code, status, blob = "TRANSPORT", type(exc).__name__, 0, b""
+            verdict, code, status, blob = "TRANSPORT", transport_reason(exc), 0, b""
         self.results.append({"action": label, "verdict": verdict, "http": status, "code": code})
         if emit:
             self.show_last()
@@ -256,7 +413,10 @@ def registry_tags(probe, auth, repo, account):
         status, body, headers = exc.code, exc.read(MAX_REPLY), exc.headers
     except (OSError, urllib.error.URLError) as exc:
         status, body, headers = 0, b"", {}
+        transport_code = transport_reason(exc)
     verdict, code = category(status, body, headers)
+    if status == 0:
+        verdict, code = "TRANSPORT", transport_code
     probe.results.append({"action": "ECR registry tags " + repo, "verdict": verdict, "http": status, "code": code})
     print(f"[{verdict:<13}] ECR registry tags {repo}" + (f" ({code}; HTTP {status})" if code else ""))
     if verdict == "ALLOWED":
@@ -280,13 +440,40 @@ def main():
     parser.add_argument("--secret-id", action="append", default=[], help="Known secret name/ARN; metadata only")
     parser.add_argument("--parameter", action="append", default=[], help="Known SSM name; value is never printed")
     parser.add_argument("--json-out", help="Write status-only results to this local file (mode 0600)")
+    parser.add_argument("--imds-only", action="store_true", help="Walk IMDS only; skip AWS API permission probes")
+    parser.add_argument("--no-imds-scan", action="store_true", help="Skip recursive IMDS walk; run AWS API probes only")
+    parser.add_argument("--imds-out", default="/tmp/elt/imds_dump.json", help="Single private JSON file containing all fetched IMDS responses")
+    parser.add_argument("--imds-all-versions", action="store_true", help="Also traverse historical API version aliases exposed at the metadata root")
+    parser.add_argument("--imds-max-nodes", type=int, default=4096)
+    parser.add_argument("--imds-max-depth", type=int, default=32)
+    parser.add_argument("--imds-max-seconds", type=int, default=180)
+    parser.add_argument("--imds-max-bytes", type=int, default=2 * 1024 * 1024, help="Maximum bytes retained per response")
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z]{2}-[a-z]+-\d", args.region):
         parser.error("invalid AWS Region")
+    if args.imds_only and args.no_imds_scan:
+        parser.error("--imds-only conflicts with --no-imds-scan")
+    if min(args.imds_max_nodes, args.imds_max_depth, args.imds_max_seconds, args.imds_max_bytes) <= 0:
+        parser.error("IMDS limits must be positive")
+    if not args.no_imds_scan:
+        try:
+            base = imds_origin()
+            token = imds_token(base, args.imds_max_seconds + 60)
+            imds_walk(base, token, out_path=args.imds_out, max_nodes=args.imds_max_nodes,
+                      max_depth=args.imds_max_depth, max_seconds=args.imds_max_seconds,
+                      max_bytes=args.imds_max_bytes, all_versions=args.imds_all_versions)
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            detail = str(exc) if isinstance(exc, ValueError) else transport_reason(exc)
+            print("[IMDS_STOP] recursive scan unavailable:", detail, file=sys.stderr)
+            if args.imds_only:
+                return 2
+    if args.imds_only:
+        return 0
     try:
         creds, expiry = metadata_credentials()
     except Exception as exc:
-        print("[STOP] IMDSv2 credentials unavailable:", type(exc).__name__, file=sys.stderr)
+        detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+        print("[STOP] IMDSv2 credentials unavailable:", detail, file=sys.stderr)
         return 2
     print("[INFO] metadata credentials loaded in memory; expiration:", expiry, "region:", args.region)
     p = Probe(creds, args.region)
@@ -339,6 +526,9 @@ def main():
     if not repos:
         print("[TARGET_NEEDED] ECR repository name: supply --ecr-repo NAME; token alone does not prove pull access")
     for repo in repos:
+        if repo == "REPOSITORY_NAME":
+            print("[TARGET_NEEDED] replace the literal REPOSITORY_NAME placeholder with a real repository name")
+            continue
         if not re.fullmatch(r"[a-z0-9]+(?:[._/-][a-z0-9]+)*", repo):
             print("[SKIPPED] malformed ECR repository:", repo)
             continue
